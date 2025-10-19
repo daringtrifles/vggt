@@ -19,7 +19,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_camera=True, enable_point=True, enable_depth=True, enable_track=True):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            enable_global_pruning=True,
+            prune_keep_ratio=0.7,
+            prune_use_gumbel=True,
+            prune_tau=1.0,
+            prune_ratio_weight=1.0,
+            prune_distill_weight=1.0,
+        )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
@@ -92,6 +102,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         if not self.training:
             predictions["images"] = images  # store the images for visualization during inference
+
+        # expose pruning-related losses if available
+        if hasattr(self.aggregator, "prune_ratio_loss"):
+            predictions["prune_ratio_loss"] = self.aggregator.prune_ratio_loss
+        if hasattr(self.aggregator, "prune_distill_loss"):
+            predictions["prune_distill_loss"] = self.aggregator.prune_distill_loss
 
         return predictions
 

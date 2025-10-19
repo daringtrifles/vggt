@@ -19,9 +19,10 @@ os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
 
 import contextlib
+import inspect
 import gc
 import json
-import logging
+import logging as py_logging
 import math
 import time
 from datetime import timedelta
@@ -40,7 +41,7 @@ from train_utils.freeze import freeze_modules
 from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
-from train_utils.optimizer import construct_optimizers
+from train_utils.optimizer import construct_optimizers, OptimizerWrapper
 
 
 class Trainer:
@@ -62,7 +63,7 @@ class Trainer:
         *,
         data: Dict[str, Any],
         model: Dict[str, Any],
-        logging: Dict[str, Any],
+        logging_cfg: Dict[str, Any],
         checkpoint: Dict[str, Any],
         max_epochs: int,
         mode: str = "train",
@@ -108,7 +109,8 @@ class Trainer:
         self.data_conf = data
         self.model_conf = model
         self.loss_conf = loss
-        self.logging_conf = logging
+        # Avoid shadowing the Python logging module by renaming the config param
+        self.logging_conf = logging_cfg
         self.checkpoint_conf = checkpoint
         self.optim_conf = optim
 
@@ -149,9 +151,29 @@ class Trainer:
         self.model.to(self.device)
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
 
-        # Construct optimizers (after moving model to device)
+        # Construct optimizer (two LR groups: pruner high LR, backbone low LR)
         if self.mode != "val":
-            self.optims = construct_optimizers(self.model, self.optim_conf)
+            named = list(self.model.named_parameters())
+            pruner_params = [p for n, p in named if n.startswith("aggregator.global_pruner.")]
+            backbone_params = [p for n, p in named if not n.startswith("aggregator.global_pruner.")]
+            if len(pruner_params) == 0:
+                py_logging.warning("No pruner params found; falling back to single param group.")
+                base_lr = self.optim_conf.optimizer.lr
+                wd = self.optim_conf.optimizer.weight_decay
+                optim = torch.optim.AdamW([{"params": [p for _, p in named], "lr": base_lr, "weight_decay": wd}])
+            else:
+                # Heuristic LRs; adjust or expose via config if desired
+                base_lr = self.optim_conf.optimizer.lr
+                lr_pruner = base_lr if base_lr > 0 else 1e-4
+                lr_backbone = min(base_lr, 1e-5) if base_lr > 0 else 1e-5
+                wd = self.optim_conf.optimizer.weight_decay
+                optim = torch.optim.AdamW(
+                    [
+                        {"params": pruner_params, "lr": lr_pruner, "weight_decay": wd},
+                        {"params": backbone_params, "lr": lr_backbone, "weight_decay": wd},
+                    ]
+                )
+            self.optims = [OptimizerWrapper(optim)]
 
         # Load checkpoint if available or specified
         if self.checkpoint_conf.resume_checkpoint_path is not None:
@@ -177,7 +199,7 @@ class Trainer:
         if env_variables_conf:
             for variable_name, value in env_variables_conf.items():
                 os.environ[variable_name] = value
-        logging.info(f"Environment:\n{json.dumps(dict(os.environ), sort_keys=True, indent=2)}")
+        py_logging.info("Environment:\n%s", json.dumps(dict(os.environ), sort_keys=True, indent=2))
 
     def _setup_torch_dist_and_backend(self, cuda_conf: Dict, distributed_conf: Dict) -> None:
         """Initializes the distributed process group and configures PyTorch backends."""
@@ -197,7 +219,7 @@ class Trainer:
 
     def _load_resuming_checkpoint(self, ckpt_path: str):
         """Loads a checkpoint from the given path to resume training."""
-        logging.info(f"Resuming training from {ckpt_path} (rank {self.rank})")
+        py_logging.info("Resuming training from %s (rank %s)", ckpt_path, self.rank)
 
         with g_pathmgr.open(ckpt_path, "rb") as f:
             checkpoint = torch.load(f, map_location="cpu")
@@ -208,11 +230,11 @@ class Trainer:
             model_state_dict, strict=self.checkpoint_conf.strict
         )
         if self.rank == 0:
-            logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
+            py_logging.info("Model state loaded. Missing keys: %s. Unexpected keys: %s.", missing or 'None', unexpected or 'None')
 
         # Load optimizer state if available and in training mode
         if "optimizer" in checkpoint:
-            logging.info(f"Loading optimizer state dict (rank {self.rank})")
+            py_logging.info("Loading optimizer state dict (rank %s)", self.rank)
             self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
 
         # Load training progress
@@ -238,37 +260,70 @@ class Trainer:
 
     def _setup_components(self):
         """Initializes all core training components using Hydra configs."""
-        logging.info("Setting up components: Model, Loss, Logger, etc.")
+        py_logging.info("Setting up components: Model, Loss, Logger, etc.")
         self.epoch = 0
         self.steps = {'train': 0, 'val': 0}
 
         # Instantiate components from configs
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
+        # Optional: Weights & Biases logger
+        self.wandb = None
+        if getattr(self.logging_conf, "wandb", None):
+            try:
+                self.wandb = instantiate(self.logging_conf.wandb, _recursive_=False)
+            except Exception as e:
+                py_logging.warning("WandB logger init failed: %s", e)
         self.model = instantiate(self.model_conf, _recursive_=False)
         self.loss = instantiate(self.loss_conf, _recursive_=False)
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
 
-        # Freeze specified model parameters if any
+        # Sanity check: aggregator and pruner presence
+        try:
+            has_agg = hasattr(self.model, "aggregator")
+            has_pruner = has_agg and hasattr(self.model.aggregator, "global_pruner")
+            py_logging.info("Aggregator present: %s; Global pruner present: %s", has_agg, has_pruner)
+            # Log concrete implementation file paths to verify local code is used
+            try:
+                model_file = inspect.getfile(self.model.__class__)
+                py_logging.info("Model class file: %s", model_file)
+                if has_agg:
+                    agg_file = inspect.getfile(self.model.aggregator.__class__)
+                    py_logging.info("Aggregator class file: %s", agg_file)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Pruner injection removed; instantiate Aggregator with pruning in model config
+
+        # Do not freeze modules; allow gradients to flow end-to-end
         if getattr(self.optim_conf, "frozen_module_names", None):
-            logging.info(
-                f"[Start] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
-            )
-            self.model = freeze_modules(
-                self.model,
-                patterns=self.optim_conf.frozen_module_names,
-            )
-            logging.info(
-                f"[Done] Freezing modules: {self.optim_conf.frozen_module_names} on rank {self.distributed_rank}"
-            )
+            py_logging.info("Skipping module freezing in favor of two-LR optimizer groups.")
+
+        # Ensure all params require grad; optimizer will control update rates
+        for _, p in self.model.named_parameters():
+            p.requires_grad = True
+
+        # Keep pruner in train mode if present
+        if hasattr(self.model, "aggregator") and hasattr(self.model.aggregator, "global_pruner"):
+            self.model.aggregator.global_pruner.train(True)
+            # Force pruning to be active and differentiable each training step
+            try:
+                self.model.aggregator.enable_global_pruning = True
+                self.model.aggregator.prune_use_gumbel = True
+                if getattr(self.model.aggregator, "aa_order", None) is not None and "global" not in self.model.aggregator.aa_order:
+                    self.model.aggregator.aa_order = ["frame", "global"]
+            except Exception:
+                pass
 
         # Log model summary on rank 0
         if self.rank == 0:
             model_summary_path = os.path.join(self.logging_conf.log_dir, "model.txt")
             model_summary(self.model, log_file=model_summary_path)
-            logging.info(f"Model summary saved to {model_summary_path}")
+            py_logging.info("Model summary saved to %s", model_summary_path)
 
-        logging.info("Successfully initialized training components.")
+        py_logging.info("Successfully initialized training components.")
 
     def _setup_dataloaders(self):
         """Initializes train and validation datasets and dataloaders."""
@@ -291,7 +346,8 @@ class Trainer:
         assert isinstance(self.model, torch.nn.Module)
 
         ddp_options = dict(
-            find_unused_parameters=distributed_conf.find_unused_parameters,
+            # Allow params not involved in current loss (e.g., heads inactive per step)
+            find_unused_parameters=True,
             gradient_as_bucket_view=distributed_conf.gradient_as_bucket_view,
             bucket_cap_mb=distributed_conf.bucket_cap_mb,
             broadcast_buffers=distributed_conf.broadcast_buffers,
@@ -403,7 +459,7 @@ class Trainer:
     def run_val(self):
         """Runs a full validation epoch if a validation dataset is available."""
         if not self.val_dataset:
-            logging.info("No validation dataset configured. Skipping validation.")
+            py_logging.info("No validation dataset configured. Skipping validation.")
             return
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
@@ -578,15 +634,20 @@ class Trainer:
                 for optim in self.optims:
                     optim.step_schedulers(self.where)
             else:
-                logging.warning(
-                    f"Skipping scheduler update since the training is at the end, i.e, {self.where} of [0,1]."
+                py_logging.warning(
+                    "Skipping scheduler update since the training is at the end, i.e, %s of [0,1].",
+                    self.where,
                 )
                     
-            # Log schedulers
+            # Log schedulers (guard when no schedulers)
             if self.steps[phase] % self.logging_conf.log_freq == 0:
                 for i, optim in enumerate(self.optims):
+                    schedulers = getattr(optim, "schedulers", None)
+                    if not schedulers:
+                        continue
                     for j, param_group in enumerate(optim.optimizer.param_groups):
-                        for option in optim.schedulers[j]:
+                        sched_map = schedulers[j] if j < len(schedulers) else {}
+                        for option in sched_map:
                             optim_prefix = (
                                 f"{i}_"
                                 if len(self.optims) > 1
@@ -598,7 +659,7 @@ class Trainer:
                             )
                             self.tb_writer.log(
                                 os.path.join("Optim", f"{optim_prefix}", option),
-                                param_group[option],
+                                param_group.get(option, None),
                                 self.steps[phase],
                             )
                 self.tb_writer.log(
@@ -670,6 +731,15 @@ class Trainer:
                     enabled=self.optim_conf.amp.enabled,
                     dtype=amp_type,
                 ):
+                    # Anneal prune_tau (optional): 1.0 -> 0.5 across training
+                    tau_start, tau_end = 1.0, 0.5
+                    current_tau = tau_start + (tau_end - tau_start) * self.where
+                    try:
+                        agg = self.model.module.aggregator if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model.aggregator
+                        if hasattr(agg, "prune_tau"):
+                            agg.prune_tau = float(current_tau)
+                    except Exception:
+                        pass
                     loss_dict = self._step(
                         chunked_batch, self.model, phase, loss_meters
                     )
@@ -681,7 +751,7 @@ class Trainer:
 
                 if not math.isfinite(loss.item()):
                     error_msg = f"Loss is {loss.item()}, attempting to stop training"
-                    logging.error(error_msg)
+                    py_logging.error(error_msg)
                     return
 
                 loss /= accum_steps
@@ -744,6 +814,17 @@ class Trainer:
         """
         # Forward pass
         y_hat = model(images=batch["images"])
+        # Ensure pruning losses are present in predictions before loss computation
+        try:
+            agg = model.module.aggregator if isinstance(model, nn.parallel.DistributedDataParallel) else model.aggregator
+            assert hasattr(agg, "prune_distill_loss") and hasattr(agg, "prune_ratio_loss"), "Pruning losses not set in Aggregator"
+
+            if hasattr(agg, "prune_ratio_loss"):
+                y_hat["prune_ratio_loss"] = agg.prune_ratio_loss
+            if hasattr(agg, "prune_distill_loss"):
+                y_hat["prune_distill_loss"] = agg.prune_distill_loss
+        except Exception:
+            pass
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
@@ -752,6 +833,27 @@ class Trainer:
         log_data = {**y_hat, **loss_dict, **batch}
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
+        # Also log to WandB if enabled
+        if self.wandb is not None:
+            keys = self._get_scalar_log_keys(phase)
+            
+            payload = {}
+            for key in keys:
+                if key in log_data:
+                    value = log_data[key].item() if torch.is_tensor(log_data[key]) else log_data[key]
+                    payload[f"{phase}/{key}"] = value
+            if payload:
+                self.wandb.log_dict(payload, step=self.steps[phase])
+            # Always log pruning losses if present
+            extra = {}
+            for k in ("loss_prune_ratio", "loss_prune_distill", "prune_ratio_loss", "prune_distill_loss"):
+                if k in log_data:
+                    v = log_data[k]
+                    extra[f"{phase}/{k}"] = v.item() if torch.is_tensor(v) else v
+            if extra:
+                self.wandb.log_dict(extra, step=self.steps[phase])
+            else:
+                py_logging.debug("No pruning losses to log to WandB")
         self._log_tb_visuals(log_data, phase, self.steps[phase])
 
         self.steps[phase] += 1

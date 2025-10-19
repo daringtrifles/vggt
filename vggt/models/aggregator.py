@@ -9,12 +9,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Tuple, List
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from vggt.layers.pruning import TokenPruner
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +64,21 @@ class Aggregator(nn.Module):
         proj_bias=True,
         ffn_bias=True,
         patch_embed="dinov2_vitl14_reg",
-        aa_order=["frame", "global"],
+        aa_order=None,
         aa_block_size=1,
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        # pruning config (applies to global attention only)
+        enable_global_pruning: bool = False,
+        prune_keep_ratio: float = 0.7,
+        prune_hidden_ratio: float = 0.25,
+        prune_dropout: float = 0.0,
+        # differentiable gating + losses
+        prune_use_gumbel: bool = True,
+        prune_tau: float = 1.0,
+        prune_ratio_weight: float = 0.0,
+        prune_distill_weight: float = 0.0,
     ):
         super().__init__()
 
@@ -112,9 +123,19 @@ class Aggregator(nn.Module):
         )
 
         self.depth = depth
-        self.aa_order = aa_order
+        self.aa_order = ["frame", "global"] if aa_order is None else aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.enable_global_pruning = enable_global_pruning
+        self.prune_keep_ratio = prune_keep_ratio
+        self.prune_use_gumbel = prune_use_gumbel
+        self.prune_tau = prune_tau
+        self.prune_ratio_weight = prune_ratio_weight
+        self.prune_distill_weight = prune_distill_weight
+        logger.info("PRUNE DISTILL WEIGHT: %s", self.prune_distill_weight)
+        self.global_pruner = None
+        if self.enable_global_pruning:
+            self.global_pruner = TokenPruner(embed_dim, hidden_ratio=prune_hidden_ratio, dropout=prune_dropout)
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -193,6 +214,11 @@ class Aggregator(nn.Module):
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
+        if B <= 0 or S <= 0:
+            raise RuntimeError(
+                f"Aggregator received empty batch or sequence: images.shape={tuple(images.shape)}. "
+                "Upstream dataloader likely produced an empty batch."
+            )
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
@@ -208,6 +234,11 @@ class Aggregator(nn.Module):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
+        if P <= 0:
+            raise RuntimeError(
+                f"Aggregator produced zero patch tokens. Check img_size/patch_size so H//patch_size and W//patch_size are > 0. "
+                f"Got H={H}, W={W}, patch_size={self.patch_size}."
+            )
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -234,6 +265,11 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
+        # reset pruning losses accumulation
+        self._prune_ratio_loss_total = torch.zeros((), device=images.device)
+        self._prune_distill_loss_total = torch.zeros((), device=images.device)
+        self._prune_loss_count = 0
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -255,6 +291,15 @@ class Aggregator(nn.Module):
         del concat_inter
         del frame_intermediates
         del global_intermediates
+
+        # finalize averaged losses for external consumption
+        if self._prune_loss_count > 0:
+            self.prune_ratio_loss = self._prune_ratio_loss_total / float(self._prune_loss_count)
+            self.prune_distill_loss = self._prune_distill_loss_total / float(self._prune_loss_count)
+        else:
+            self.prune_ratio_loss = torch.zeros((), device=images.device)
+            self.prune_distill_loss = torch.zeros((), device=images.device)
+
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
@@ -295,10 +340,83 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+            if self.enable_global_pruning and self.global_pruner is not None:
+                # keep special tokens and prune only patch tokens
+                num_special = self.patch_start_idx
+                special = tokens[:, :num_special, :]
+                patches = tokens[:, num_special:, :]
+
+                # compute per-token scores on patch tokens
+                scores = self.global_pruner(patches)  # [B, S*P - num_special]
+                keep_k = max(1, int(scores.shape[1] * self.prune_keep_ratio))
+                if self.training and self.prune_use_gumbel:
+                    # Teacher: full sequence forward (no grad to teacher for distill)
+                    teacher_out = self.global_blocks[global_idx](tokens, pos=pos).detach()
+
+                    # Straight-through hard top-k gate: hard forward, soft gradients
+                    soft = torch.sigmoid(scores / max(self.prune_tau, 1e-6))  # [B, Np]
+                    topk_idx = torch.topk(scores, k=keep_k, dim=1, largest=True, sorted=False).indices
+                    hard = torch.zeros_like(scores)
+                    hard.scatter_(1, topk_idx, 1.0)
+                    st_mask = hard + soft - soft.detach()  # [B, Np]
+
+                    # Apply ST mask at full length
+                    patches_masked = patches * st_mask.unsqueeze(-1)
+                    tokens_in = torch.cat([special, patches_masked], dim=1)
+                    pos_in = pos
+
+                    student_out = self.global_blocks[global_idx](tokens_in, pos=pos_in)
+
+                    # Distillation loss between student and teacher on patch tokens
+                    distill_loss = F.mse_loss(student_out[:, num_special:, :], teacher_out[:, num_special:, :])
+                    # Ratio loss to match target keep ratio (use soft mask expectation)
+                    ratio_target = keep_k / scores.shape[1]
+                    ratio_loss = ((soft.mean(dim=1) - ratio_target) ** 2).mean()
+
+                    # Accumulate weighted losses
+                    if self.prune_distill_weight > 0.0:
+                        self._prune_distill_loss_total = self._prune_distill_loss_total + self.prune_distill_weight * distill_loss
+                    if self.prune_ratio_weight > 0.0:
+                        self._prune_ratio_loss_total = self._prune_ratio_loss_total + self.prune_ratio_weight * ratio_loss
+                    self._prune_loss_count += 1
+
+                    tokens = student_out
+                else:
+                    # Inference-time hard top-k pruning and scatter back
+                    topk = torch.topk(scores, k=keep_k, dim=1, largest=True, sorted=False)
+                    keep_idx = topk.indices  # [B, keep_k]
+
+                    # gather kept tokens per batch
+                    gather_indices = keep_idx.unsqueeze(-1).expand(-1, -1, patches.shape[-1])
+                    kept = torch.gather(patches, dim=1, index=gather_indices)
+
+                    # concatenate special tokens back
+                    pruned_tokens = torch.cat([special, kept], dim=1)
+
+                    # run the global block on pruned sequence
+                    if pos is not None:
+                        pos_special = pos[:, :num_special, :]
+                        pos_patches = pos[:, num_special:, :]
+                        pos_kept = torch.gather(pos_patches, dim=1, index=keep_idx.unsqueeze(-1).expand(-1, -1, pos.shape[-1]))
+                        pos_pruned = torch.cat([pos_special, pos_kept], dim=1)
+                    else:
+                        pos_pruned = None
+
+                    pruned_out = self.global_blocks[global_idx](pruned_tokens, pos=pos_pruned)
+
+                    # scatter back to full sequence
+                    out = tokens.clone()
+                    out[:, :num_special, :] = pruned_out[:, :num_special, :]
+                    patch_out = pruned_out[:, num_special:, :]
+                    scatter_indices = (keep_idx + num_special).unsqueeze(-1).expand(-1, -1, patches.shape[-1])
+                    out.scatter_(dim=1, index=scatter_indices, src=patch_out)
+                    tokens = out
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                if self.training:
+                    tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                else:
+                    tokens = self.global_blocks[global_idx](tokens, pos=pos)
+
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

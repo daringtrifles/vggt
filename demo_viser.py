@@ -316,6 +316,7 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
+parser.add_argument("--checkpoint", type=str, default=None, help="Path to a checkpoint.pt to load into the model")
 
 
 def main():
@@ -345,8 +346,15 @@ def main():
     # model = VGGT.from_pretrained("facebook/VGGT-1B")
 
     model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    if args.checkpoint:
+        print(f"Loading checkpoint from {args.checkpoint}...")
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Checkpoint loaded. Missing: {missing or 'None'}, Unexpected: {unexpected or 'None'}")
+    else:
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
     model.eval()
     model = model.to(device)

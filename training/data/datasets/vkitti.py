@@ -111,7 +111,7 @@ class VKittiDataset(BaseDataset):
             seq_index = random.randint(0, self.sequence_list_len - 1)
 
         if seq_name is None:
-            seq_name = self.sequence_list[seq_index]
+            seq_name = self.sequence_list[seq_index%self.sequence_list_len]
 
         camera_id = int(seq_name[-1])
 

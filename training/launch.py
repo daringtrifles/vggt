@@ -5,6 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import os
+import sys
+
+# Ensure local 'vggt' package (this repo) is imported over any site-packages
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from hydra import initialize, compose
 from omegaconf import DictConfig, OmegaConf
 from trainer import Trainer
@@ -23,7 +32,12 @@ def main():
     with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=args.config)
 
-    trainer = Trainer(**cfg)
+    # Map config keys to match Trainer's signature
+    params = {k: v for k, v in cfg.items()}
+    if "logging" in params and "logging_cfg" not in params:
+        params["logging_cfg"] = params.pop("logging")
+
+    trainer = Trainer(**params)
     trainer.run()
 
 

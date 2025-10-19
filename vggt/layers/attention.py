@@ -49,6 +49,12 @@ class Attention(nn.Module):
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
+        # Validate inputs to avoid cryptic kernel errors downstream
+        if B <= 0 or N <= 0:
+            raise RuntimeError(
+                f"Attention received empty input: x.shape={tuple(x.shape)}. "
+                "This typically indicates an empty batch or zero-length sequence from the dataloader."
+            )
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)

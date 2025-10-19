@@ -1,14 +1,14 @@
 defaults:
   - default_dataset.yaml
 
-exp_name: exp001
+exp_name: first_try_with_stuff_setup
 img_size: 518
 num_workers: 8
 seed_value: 42
-accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
+accum_steps: 1    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
 patch_size: 14
 val_epoch_freq: 5
-max_img_per_gpu: 48
+max_img_per_gpu: 4
 
 limit_train_batches: 800
 limit_val_batches: 400
@@ -25,13 +25,18 @@ data:
       patch_size: ${patch_size}
       debug: False
       repeat_batch: False
+      training: True
+      inside_random: True
+      # Ensure at least 2 images per sample to avoid empty sequences
+      img_nums: [2, 8]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.vkitti.VKittiDataset
           split: train
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
+          VKitti_DIR: /home/harshapolavaram/vggt/training/vkitti
+          len_train: 100000
+          expand_ratio: 8 
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -40,14 +45,16 @@ data:
       img_size: ${img_size}
       patch_size: ${patch_size}
       debug: False
+      training: False
+      inside_random: False
+      # Keep validation sequence length >= 2 as well
+      img_nums: [2, 8]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.co3d.Co3dDataset
+        - _target_: data.datasets.vkitti.VKittiDataset
           split: test
-          CO3D_DIR: /YOUR/PATH/TO/CO3D
-          CO3D_ANNOTATION_DIR: /YOUR/PATH/TO/CO3D_ANNOTATION
-
+          VKitti_DIR: /home/harshapolavaram/vggt/training/vkitti
 
 logging:
   log_dir: logs
@@ -59,6 +66,11 @@ logging:
   tensorboard_writer:
     _target_: train_utils.tb_writer.TensorBoardLogger
     path: ${logging.log_dir}/tensorboard
+  wandb:
+    _target_: train_utils.wandb_logger.WandBLogger
+    project: vggt
+    run_name: ${exp_name}
+    mode: online
   scalar_keys_to_log:
     train:
       keys_to_log:
@@ -70,6 +82,10 @@ logging:
         - loss_conf_depth
         - loss_reg_depth
         - loss_grad_depth
+        - loss_prune_ratio
+        - loss_prune_distill
+        - prune_ratio_loss
+        - prune_distill_loss
     val:
       keys_to_log:
         - loss_objective
@@ -80,13 +96,17 @@ logging:
         - loss_conf_depth
         - loss_reg_depth
         - loss_grad_depth
+        - loss_prune_ratio
+        - loss_prune_distill
+        - prune_ratio_loss
+        - prune_distill_loss
 
 
 
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  resume_checkpoint_path:  /home/harshapolavaram/.cache/huggingface/hub/models--facebook--VGGT-1B/snapshots/860abec7937da0a4c03c41d3c269c366e82abdf9/model.pt
   strict: False
 
 
@@ -119,7 +139,7 @@ optim:
     weight_decay: 0.05
 
   frozen_module_names:
-      - "*aggregator*"  # example, freeze the aggregator
+
 
   amp:
     enabled: True

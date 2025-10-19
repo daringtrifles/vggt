@@ -73,6 +73,15 @@ class MultitaskLoss(torch.nn.Module):
         if "track" in predictions:
             raise NotImplementedError("Track loss is not cleaned up yet")
         
+        # Optional pruning/distillation losses from Aggregator
+        if "prune_ratio_loss" in predictions:
+            loss_dict["loss_prune_ratio"] = predictions["prune_ratio_loss"]
+            total_loss = total_loss + predictions["prune_ratio_loss"]
+
+        if "prune_distill_loss" in predictions:
+            loss_dict["loss_prune_distill"] = predictions["prune_distill_loss"]
+            total_loss = total_loss + predictions["prune_distill_loss"]
+        
         loss_dict["objective"] = total_loss
 
         return loss_dict
