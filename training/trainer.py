@@ -165,7 +165,8 @@ class Trainer:
                 # Heuristic LRs; adjust or expose via config if desired
                 base_lr = self.optim_conf.optimizer.lr
                 lr_pruner = base_lr if base_lr > 0 else 1e-4
-                lr_backbone = min(base_lr, 1e-5) if base_lr > 0 else 1e-5
+                #lr_backbone = min(base_lr, 1e-5) if base_lr > 0 else 1e-5
+                lr_backbone = 0
                 wd = self.optim_conf.optimizer.weight_decay
                 optim = torch.optim.AdamW(
                     [
@@ -305,7 +306,7 @@ class Trainer:
         for _, p in self.model.named_parameters():
             p.requires_grad = True
 
-        # Keep pruner in train mode if present
+        '''        # Keep pruner in train mode if present
         if hasattr(self.model, "aggregator") and hasattr(self.model.aggregator, "global_pruner"):
             self.model.aggregator.global_pruner.train(True)
             # Force pruning to be active and differentiable each training step
@@ -315,7 +316,7 @@ class Trainer:
                 if getattr(self.model.aggregator, "aa_order", None) is not None and "global" not in self.model.aggregator.aa_order:
                     self.model.aggregator.aa_order = ["frame", "global"]
             except Exception:
-                pass
+                pass'''
 
         # Log model summary on rank 0
         if self.rank == 0:

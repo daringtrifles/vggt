@@ -133,6 +133,12 @@ class Aggregator(nn.Module):
         self.prune_ratio_weight = prune_ratio_weight
         self.prune_distill_weight = prune_distill_weight
         logger.info("PRUNE DISTILL WEIGHT: %s", self.prune_distill_weight)
+        
+        # Sparse pruning: only apply at specific layers (e.g., every 8 layers for 24 total)
+        # This applies pruning 3 times across 24 global blocks: at layers 7, 15, 23
+        self.prune_layers = [7, 15, 23] if depth == 24 else []
+        logger.info("Pruning will be applied at global block indices: %s", self.prune_layers)
+        
         self.global_pruner = None
         if self.enable_global_pruning:
             self.global_pruner = TokenPruner(embed_dim, hidden_ratio=prune_hidden_ratio, dropout=prune_dropout)
@@ -340,7 +346,12 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if self.enable_global_pruning and self.global_pruner is not None:
+            # Only apply pruning at specific layers
+            should_prune = (self.enable_global_pruning and 
+                          self.global_pruner is not None and 
+                          global_idx in self.prune_layers)
+            
+            if should_prune:
                 # keep special tokens and prune only patch tokens
                 num_special = self.patch_start_idx
                 special = tokens[:, :num_special, :]
@@ -385,6 +396,14 @@ class Aggregator(nn.Module):
                     # Inference-time hard top-k pruning and scatter back
                     topk = torch.topk(scores, k=keep_k, dim=1, largest=True, sorted=False)
                     keep_idx = topk.indices  # [B, keep_k]
+                    '''
+                    keep_idx = torch.stack([
+                        torch.randperm(scores.shape[1], device=scores.device)[:keep_k]
+                        for _ in range(scores.shape[0])
+                    ])
+                    '''
+                    print(f'only keeping {keep_k} out of {scores.shape[1]}')
+
 
                     # gather kept tokens per batch
                     gather_indices = keep_idx.unsqueeze(-1).expand(-1, -1, patches.shape[-1])

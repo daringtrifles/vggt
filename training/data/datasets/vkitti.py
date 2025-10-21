@@ -150,6 +150,7 @@ class VKittiDataset(BaseDataset):
         world_points = []
         point_masks = []
         extrinsics = []
+        extrinsics_cam2world = []
         intrinsics = []
         original_sizes = []
 
@@ -170,6 +171,13 @@ class VKittiDataset(BaseDataset):
             extri_opencv = camera_parameters[image_idx][2:].reshape(4, 4)
             extri_opencv = extri_opencv[:3]
 
+            # Compute camera-to-world (3x4) from world-to-camera extrinsic
+            R_world_to_cam = extri_opencv[:, :3]
+            t_world_to_cam = extri_opencv[:, 3]
+            R_cam_to_world = R_world_to_cam.T
+            t_cam_to_world = -np.dot(R_cam_to_world, t_world_to_cam)
+            extri_cam2world = np.hstack((R_cam_to_world, t_cam_to_world.reshape(3, 1)))
+            extri_opencv = extri_cam2world
             intri_opencv = np.eye(3)
             intri_opencv[0, 0] = camera_intrinsic[image_idx][-4]
             intri_opencv[1, 1] = camera_intrinsic[image_idx][-3]
@@ -202,6 +210,7 @@ class VKittiDataset(BaseDataset):
             images.append(image)
             depths.append(depth_map)
             extrinsics.append(extri_opencv)
+            extrinsics_cam2world.append(extri_cam2world)
             intrinsics.append(intri_opencv)
             cam_points.append(cam_coords_points)
             world_points.append(world_coords_points)
@@ -217,6 +226,7 @@ class VKittiDataset(BaseDataset):
             "depths": depths,
             "extrinsics": extrinsics,
             "intrinsics": intrinsics,
+            "extrinsics_cam2world": extrinsics_cam2world,
             "cam_points": cam_points,
             "world_points": world_points,
             "point_masks": point_masks,

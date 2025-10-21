@@ -3,7 +3,8 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+#python demo_viser.py  --image_folder ~/vggt/training/vkitti/Scene01/15-deg-left/frames/rgb/Camera_0 --checkpoint /home/harshapolavaram/vggt_new/vggt/training/logs/second_try_no_pruning_vkitti_change_1e-5_lr_800_edited_sequence_list_yes_inversion_overnight_run/ckpts/checkpoint_17.pt
+#python demo_viser.py  --image_folder ~/vggt/training/vkitti/Scene01/15-deg-left/frames/rgb/Camera_0 --checkpoint /home/harshapolavaram/vggt_new/vggt/training/logs/pruning_with_lower_distill_weight/ckpts/checkpoint_0.pt
 import os
 import glob
 import time
@@ -361,7 +362,7 @@ def main():
 
     # Use the provided image folder path
     print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*"))
+    image_names = glob.glob(os.path.join(args.image_folder, "*"))[:50]
     print(f"Found {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)

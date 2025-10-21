@@ -24,11 +24,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             patch_size=patch_size,
             embed_dim=embed_dim,
             enable_global_pruning=True,
-            prune_keep_ratio=0.7,
+            prune_keep_ratio=0.75,  # Less aggressive: keep 75% instead of 60%
             prune_use_gumbel=True,
             prune_tau=1.0,
-            prune_ratio_weight=1.0,
-            prune_distill_weight=1.0,
+            prune_ratio_weight=0.3,
+            prune_distill_weight=0.15,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
