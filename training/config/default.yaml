@@ -1,7 +1,7 @@
 defaults:
   - default_dataset.yaml
 
-exp_name: pruning_with_lower_distill_weight
+exp_name: cumulative_pruning_with_lower_distill_weight
 img_size: 518
 num_workers: 8
 seed_value: 42

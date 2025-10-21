@@ -24,11 +24,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             patch_size=patch_size,
             embed_dim=embed_dim,
             enable_global_pruning=True,
-            prune_keep_ratio=0.75,  # Less aggressive: keep 75% instead of 60%
+            prune_keep_ratio=0.7,  # Less aggressive: keep 75% instead of 60%
             prune_use_gumbel=True,
             prune_tau=1.0,
             prune_ratio_weight=0.3,
-            prune_distill_weight=0.15,
+            prune_distill_weight=0.25,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
@@ -53,7 +53,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - depth (torch.Tensor): Predicted depth maps with shape [B, S, H, W, 1]
                 - depth_conf (torch.Tensor): Confidence scores for depth predictions with shape [B, S, H, W]
                 - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
-                - world_points_conf (torch.Tensor): Confidence scores for world points with shape [B, S, H, W]
+                -
+                 world_points_conf (torch.Tensor): Confidence scores for world points with shape [B, S, H, W]
                 - images (torch.Tensor): Original input images, preserved for visualization
 
                 If query_points is provided, also includes:
@@ -108,6 +109,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["prune_ratio_loss"] = self.aggregator.prune_ratio_loss
         if hasattr(self.aggregator, "prune_distill_loss"):
             predictions["prune_distill_loss"] = self.aggregator.prune_distill_loss
+
+        # expose attention timings if available
+        if hasattr(self.aggregator, "last_frame_time_s"):
+            predictions["frame_time_s"] = self.aggregator.last_frame_time_s
+        if hasattr(self.aggregator, "last_global_time_s"):
+            predictions["global_time_s"] = self.aggregator.last_global_time_s
 
         return predictions
 

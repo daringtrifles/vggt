@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -136,7 +137,7 @@ class Aggregator(nn.Module):
         
         # Sparse pruning: only apply at specific layers (e.g., every 8 layers for 24 total)
         # This applies pruning 3 times across 24 global blocks: at layers 7, 15, 23
-        self.prune_layers = [7, 15, 23] if depth == 24 else []
+        self.prune_layers = [4, 12, 20] if depth == 24 else []
         logger.info("Pruning will be applied at global block indices: %s", self.prune_layers)
         
         self.global_pruner = None
@@ -276,16 +277,38 @@ class Aggregator(nn.Module):
         self._prune_distill_loss_total = torch.zeros((), device=images.device)
         self._prune_loss_count = 0
 
+        # init timers
+        frame_time_s_total = 0.0
+        global_time_s_total = 0.0
+        # Reset cumulative keep mask for global pruning (over patch tokens only)
+        self._keep_mask_flat = None  # shape per batch: [B, S*P - num_special]
+        # Also track kept indices to run smaller global attention between prune layers
+        self._kept_idx_flat = None  # shape per batch: [B, K]
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    use_cuda = tokens.is_cuda
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    frame_time_s_total += (time.perf_counter() - t0)
                 elif attn_type == "global":
+                    use_cuda = tokens.is_cuda
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    t0 = time.perf_counter()
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
+                    if use_cuda:
+                        torch.cuda.synchronize()
+                    global_time_s_total += (time.perf_counter() - t0)
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
@@ -305,6 +328,10 @@ class Aggregator(nn.Module):
         else:
             self.prune_ratio_loss = torch.zeros((), device=images.device)
             self.prune_distill_loss = torch.zeros((), device=images.device)
+
+        # expose timers
+        self.last_frame_time_s = float(frame_time_s_total)
+        self.last_global_time_s = float(global_time_s_total)
 
         return output_list, self.patch_start_idx
 
@@ -356,63 +383,71 @@ class Aggregator(nn.Module):
                 num_special = self.patch_start_idx
                 special = tokens[:, :num_special, :]
                 patches = tokens[:, num_special:, :]
+                Bsz, Np, Ch = patches.shape
+
+                # Initialize cumulative keep mask on first prune
+                if self._keep_mask_flat is None or self._keep_mask_flat.shape[1] != Np:
+                    self._keep_mask_flat = torch.ones(Bsz, Np, device=tokens.device, dtype=patches.dtype)
 
                 # compute per-token scores on patch tokens
-                scores = self.global_pruner(patches)  # [B, S*P - num_special]
-                keep_k = max(1, int(scores.shape[1] * self.prune_keep_ratio))
-                if self.training and self.prune_use_gumbel:
-                    # Teacher: full sequence forward (no grad to teacher for distill)
-                    teacher_out = self.global_blocks[global_idx](tokens, pos=pos).detach()
+                scores = self.global_pruner(patches)  # [B, Np]
 
-                    # Straight-through hard top-k gate: hard forward, soft gradients
+                # Only consider previously kept tokens when selecting new top-k
+                masked_scores = scores.masked_fill(self._keep_mask_flat < 0.5, float('-inf'))
+                prev_kept = self._keep_mask_flat.sum(dim=1)  # [B]
+                keep_k = prev_kept.mul(self.prune_keep_ratio).floor().clamp(min=1).to(torch.int64)  # [B]
+
+                if self.training and self.prune_use_gumbel:
+                    # Straight-through gate: hard forward, soft backward
                     soft = torch.sigmoid(scores / max(self.prune_tau, 1e-6))  # [B, Np]
-                    topk_idx = torch.topk(scores, k=keep_k, dim=1, largest=True, sorted=False).indices
+                    # respect previous mask also in soft path
+                    soft = soft * self._keep_mask_flat
+
+                    # Build hard top-k per batch on masked scores
+                    keep_idx_list = []
+                    for b in range(Bsz):
+                        k_b = int(keep_k[b].item())
+                        keep_idx_list.append(torch.topk(masked_scores[b], k=k_b, dim=0, largest=True, sorted=False).indices)
+                    keep_idx = torch.stack(keep_idx_list, dim=0)  # [B, k_b]
                     hard = torch.zeros_like(scores)
-                    hard.scatter_(1, topk_idx, 1.0)
+                    for b in range(Bsz):
+                        k_b = int(keep_k[b].item())
+                        if k_b > 0:
+                            hard[b].scatter_(0, keep_idx[b][:k_b], 1.0)
                     st_mask = hard + soft - soft.detach()  # [B, Np]
 
-                    # Apply ST mask at full length
-                    patches_masked = patches * st_mask.unsqueeze(-1)
-                    tokens_in = torch.cat([special, patches_masked], dim=1)
-                    pos_in = pos
+                    # Build teacher and student inputs at full length
+                    # Build teacher and student inputs at full length
+                    tokens_prev = torch.cat([special, patches * self._keep_mask_flat.unsqueeze(-1)], dim=1)
+                    tokens_student = torch.cat([special, patches * soft.unsqueeze(-1)], dim=1)
 
-                    student_out = self.global_blocks[global_idx](tokens_in, pos=pos_in)
+                    # Teacher: no grad
+                    with torch.no_grad():
+                        teacher_out = self.global_blocks[global_idx](tokens_prev, pos=pos)
+                    # Student
+                    student_out = self.global_blocks[global_idx](tokens_student, pos=pos)
 
-                    # Distillation loss between student and teacher on patch tokens
-                    distill_loss = F.mse_loss(student_out[:, num_special:, :], teacher_out[:, num_special:, :])
-                    # Ratio loss to match target keep ratio (use soft mask expectation)
-                    ratio_target = keep_k / scores.shape[1]
-                    ratio_loss = ((soft.mean(dim=1) - ratio_target) ** 2).mean()
+                    # Distillation loss (token-wise). You can switch to kept-only if preferred.
+                    teacher_patches = teacher_out[:, num_special:, :]
+                    student_patches = student_out[:, num_special:, :]
+                    distill_loss = F.mse_loss(student_patches, teacher_patches)
 
-                    # Accumulate weighted losses
+                    # Ratio loss: match keep fraction among remaining
+                    remaining = prev_kept.clamp(min=1.0)
+                    soft_kept = soft.sum(dim=1)
+                    ratio_target = (keep_k.float() / remaining).mean()
+                    ratio_loss = (((soft_kept / remaining) - ratio_target) ** 2).mean()
+
                     if self.prune_distill_weight > 0.0:
                         self._prune_distill_loss_total = self._prune_distill_loss_total + self.prune_distill_weight * distill_loss
                     if self.prune_ratio_weight > 0.0:
                         self._prune_ratio_loss_total = self._prune_ratio_loss_total + self.prune_ratio_weight * ratio_loss
                     self._prune_loss_count += 1
 
-                    tokens = student_out
-                else:
-                    # Inference-time hard top-k pruning and scatter back
-                    topk = torch.topk(scores, k=keep_k, dim=1, largest=True, sorted=False)
-                    keep_idx = topk.indices  # [B, keep_k]
-                    '''
-                    keep_idx = torch.stack([
-                        torch.randperm(scores.shape[1], device=scores.device)[:keep_k]
-                        for _ in range(scores.shape[0])
-                    ])
-                    '''
-                    print(f'only keeping {keep_k} out of {scores.shape[1]}')
-
-
-                    # gather kept tokens per batch
-                    gather_indices = keep_idx.unsqueeze(-1).expand(-1, -1, patches.shape[-1])
+                    # For subsequent layers in this forward, use reduced sequence: gather kept
+                    gather_indices = keep_idx.unsqueeze(-1).expand(-1, -1, Ch)
                     kept = torch.gather(patches, dim=1, index=gather_indices)
-
-                    # concatenate special tokens back
                     pruned_tokens = torch.cat([special, kept], dim=1)
-
-                    # run the global block on pruned sequence
                     if pos is not None:
                         pos_special = pos[:, :num_special, :]
                         pos_patches = pos[:, num_special:, :]
@@ -420,21 +455,88 @@ class Aggregator(nn.Module):
                         pos_pruned = torch.cat([pos_special, pos_kept], dim=1)
                     else:
                         pos_pruned = None
-
                     pruned_out = self.global_blocks[global_idx](pruned_tokens, pos=pos_pruned)
 
                     # scatter back to full sequence
                     out = tokens.clone()
                     out[:, :num_special, :] = pruned_out[:, :num_special, :]
                     patch_out = pruned_out[:, num_special:, :]
-                    scatter_indices = (keep_idx + num_special).unsqueeze(-1).expand(-1, -1, patches.shape[-1])
+                    scatter_indices = (keep_idx + num_special).unsqueeze(-1).expand(-1, -1, Ch)
                     out.scatter_(dim=1, index=scatter_indices, src=patch_out)
                     tokens = out
-            else:
-                if self.training:
-                    tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+
+                    # Update cumulative keep mask and indices
+                    new_keep_mask = torch.zeros_like(self._keep_mask_flat)
+                    for b in range(Bsz):
+                        k_b = int(keep_k[b].item())
+                        if k_b > 0:
+                            new_keep_mask[b].scatter_(0, keep_idx[b][:k_b], 1.0)
+                    self._keep_mask_flat = self._keep_mask_flat * new_keep_mask
+                    self._kept_idx_flat = keep_idx
                 else:
-                    tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                    # Inference-time hard pruning: gather kept and run reduced sequence
+                    keep_idx_list = []
+                    for b in range(Bsz):
+                        k_b = int(keep_k[b].item())
+                        keep_idx_list.append(torch.topk(masked_scores[b], k=k_b, dim=0, largest=True, sorted=False).indices)
+                    keep_idx = torch.stack(keep_idx_list, dim=0)
+
+                    gather_indices = keep_idx.unsqueeze(-1).expand(-1, -1, Ch)
+                    kept = torch.gather(patches, dim=1, index=gather_indices)
+                    pruned_tokens = torch.cat([special, kept], dim=1)
+                    if pos is not None:
+                        pos_special = pos[:, :num_special, :]
+                        pos_patches = pos[:, num_special:, :]
+                        pos_kept = torch.gather(pos_patches, dim=1, index=keep_idx.unsqueeze(-1).expand(-1, -1, pos.shape[-1]))
+                        pos_pruned = torch.cat([pos_special, pos_kept], dim=1)
+                    else:
+                        pos_pruned = None
+                    pruned_out = self.global_blocks[global_idx](pruned_tokens, pos=pos_pruned)
+
+                    out = tokens.clone()
+                    out[:, :num_special, :] = pruned_out[:, :num_special, :]
+                    patch_out = pruned_out[:, num_special:, :]
+                    scatter_indices = (keep_idx + num_special).unsqueeze(-1).expand(-1, -1, Ch)
+                    out.scatter_(dim=1, index=scatter_indices, src=patch_out)
+                    tokens = out
+
+                    # Update cumulative keep mask and indices
+                    new_keep_mask = torch.zeros_like(self._keep_mask_flat)
+                    for b in range(Bsz):
+                        k_b = int(keep_k[b].item())
+                        if k_b > 0:
+                            new_keep_mask[b].scatter_(0, keep_idx[b][:k_b], 1.0)
+                    self._keep_mask_flat = self._keep_mask_flat * new_keep_mask
+                    self._kept_idx_flat = keep_idx
+            else:
+                # For non-prune global layers, always run with current kept indices if available
+                num_special = self.patch_start_idx
+                if self._kept_idx_flat is not None and self._kept_idx_flat.numel() > 0:
+                    special = tokens[:, :num_special, :]
+                    patches = tokens[:, num_special:, :]
+                    Bsz, _, Ch = patches.shape
+                    gather_indices = self._kept_idx_flat.unsqueeze(-1).expand(-1, -1, Ch)
+                    pruned_patches = torch.gather(patches, dim=1, index=gather_indices)
+                    pruned_tokens = torch.cat([special, pruned_patches], dim=1)
+                    if pos is not None:
+                        pos_special = pos[:, :num_special, :]
+                        pos_patches = pos[:, num_special:, :]
+                        pos_kept = torch.gather(pos_patches, dim=1, index=self._kept_idx_flat.unsqueeze(-1).expand(-1, -1, pos.shape[-1]))
+                        pos_pruned = torch.cat([pos_special, pos_kept], dim=1)
+                    else:
+                        pos_pruned = None
+                    small_out = self.global_blocks[global_idx](pruned_tokens, pos=pos_pruned) if not self.training else checkpoint(self.global_blocks[global_idx], pruned_tokens, pos_pruned, use_reentrant=self.use_reentrant)
+                    # scatter back
+                    out = tokens.clone()
+                    out[:, :num_special, :] = small_out[:, :num_special, :]
+                    scatter_indices = (self._kept_idx_flat + num_special).unsqueeze(-1).expand(-1, -1, Ch)
+                    out.scatter_(dim=1, index=scatter_indices, src=small_out[:, num_special:, :])
+                    tokens = out
+                else:
+                    if self.training:
+                        tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                    else:
+                        tokens = self.global_blocks[global_idx](tokens, pos=pos)
 
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
